@@ -130,31 +130,31 @@ class DeepseekV3TopkRouter(nn.Module):
         self.register_buffer("e_score_correction_bias", torch.zeros((self.n_routed_experts)))
 
     @torch.no_grad()
-    def get_topk_indices(self, scores):
-        scores_for_choice = scores.view(-1, self.n_routed_experts) + self.e_score_correction_bias.unsqueeze(0)
+    def get_topk_indices(self, scores):  #score: [9, 256]
+        scores_for_choice = scores.view(-1, self.n_routed_experts) + self.e_score_correction_bias.unsqueeze(0)   # [9, 256]
         group_scores = (
-            scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)
-            .topk(2, dim=-1)[0]
-            .sum(dim=-1)
-        )
-        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1)
+            scores_for_choice.view(-1, self.n_group, self.n_routed_experts // self.n_group)   # [9, 8, 32]
+            .topk(2, dim=-1)[0]   #[9, 8, 2]
+            .sum(dim=-1)  #[9, 8]
+        )  #[9, 8]
+        group_idx = torch.topk(group_scores, k=self.topk_group, dim=-1, sorted=False)[1]  # [9, 4]
+        group_mask = torch.zeros_like(group_scores) # [9, 8]
+        group_mask.scatter_(1, group_idx, 1)  # set the selected group to 1
         score_mask = (
             group_mask.unsqueeze(-1)
             .expand(-1, self.n_group, self.n_routed_experts // self.n_group)
             .reshape(-1, self.n_routed_experts)
-        )
-        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)
-        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]
+        )  #[9, 256]
+        scores_for_choice = scores_for_choice.masked_fill(~score_mask.bool(), 0.0)  # [9, 256]
+        topk_indices = torch.topk(scores_for_choice, k=self.top_k, dim=-1, sorted=False)[1]  # [9, 8]
         return topk_indices
 
     def forward(self, hidden_states):
-        hidden_states = hidden_states.view(-1, self.config.hidden_size)
-        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))
+        hidden_states = hidden_states.view(-1, self.config.hidden_size) #[9, 7168]
+        router_logits = F.linear(hidden_states.type(torch.float32), self.weight.type(torch.float32))    # self.weight: [256, 7168], -> router_logits: [9, 256]
         scores = router_logits.sigmoid()
-        topk_indices = self.get_topk_indices(scores)
-        topk_weights = scores.gather(1, topk_indices)
+        topk_indices = self.get_topk_indices(scores)  # [9, 8]
+        topk_weights = scores.gather(1, topk_indices)  #[9, 256]
         if self.norm_topk_prob:
             denominator = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
             topk_weights /= denominator
@@ -187,8 +187,8 @@ class DeepseekV3MoE(nn.Module):
         to not have to do a loop here (deepseek has 256 experts soooo yeah).
         """
         final_hidden_states = torch.zeros_like(hidden_states, dtype=topk_weights.dtype)
-        expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=len(self.experts))
-        expert_mask = expert_mask.permute(2, 0, 1)
+        expert_mask = torch.nn.functional.one_hot(topk_indices, num_classes=len(self.experts))  #[9, 8, 256]
+        expert_mask = expert_mask.permute(2, 0, 1)  #[256, 9, 8]
 
         for expert_idx in range(len(self.experts)):
             expert = self.experts[expert_idx]
@@ -205,13 +205,13 @@ class DeepseekV3MoE(nn.Module):
         # in original deepseek, the output of the experts are gathered once we leave this module
         # thus the moe module is itelsf an IsolatedParallel module
         # and all expert are "local" meaning we shard but we don't gather
-        return final_hidden_states.type(hidden_states.dtype)
+        return final_hidden_states.type(hidden_states.dtype)    #[9, 7168]
 
     def forward(self, hidden_states):
-        residuals = hidden_states
+        residuals = hidden_states   # [1, 9, 7168]
         orig_shape = hidden_states.shape
-        topk_indices, topk_weights = self.gate(hidden_states)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+        topk_indices, topk_weights = self.gate(hidden_states)  # topk_indices: [9, 8], topk_weights: [9, 8]
+        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])  # [9, 7168]
         hidden_states = self.moe(hidden_states, topk_indices, topk_weights).view(*orig_shape)
         hidden_states = hidden_states + self.shared_experts(residuals)
         return hidden_states
@@ -482,7 +482,7 @@ class DeepseekV3DecoderLayer(nn.Module):
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         residual = hidden_states
 
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.input_layernorm(hidden_states)  # [1, 9, 7168]
 
         # Self Attention
         hidden_states, self_attn_weights = self.self_attn(
